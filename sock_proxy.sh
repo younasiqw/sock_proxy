@@ -3,7 +3,7 @@
 # =================================================================
 # Linux 全局 Socks5 代理配置脚本 (Tun2Socks方案)
 # 适配：Ubuntu/Debian/CentOS
-# 特性：防SSH断连、开机自启、支持无密码Socks5
+# 特性：策略路由防SSH断连、开机自启、支持无密码Socks5
 # =================================================================
 
 # 颜色定义
@@ -26,14 +26,15 @@ SERVICE_FILE="/etc/systemd/system/tun2socks.service"
 
 # 安装依赖
 check_dependencies() {
-    if ! command -v wget &> /dev/null || ! command -v unzip &> /dev/null || ! command -v ip &> /dev/null; then
-        echo -e "${YELLOW}正在尝试安装必要依赖 (wget, unzip, iproute2)...${PLAIN}"
+    # 新增 iptables 依赖，用于标记 SSH 流量
+    if ! command -v wget &> /dev/null || ! command -v unzip &> /dev/null || ! command -v ip &> /dev/null || ! command -v iptables &> /dev/null; then
+        echo -e "${YELLOW}正在尝试安装必要依赖 (wget, unzip, iproute2, iptables)...${PLAIN}"
         if [ -x "$(command -v apt)" ]; then
-            apt update -y && apt install wget unzip iproute2 -y
+            apt update -y && apt install wget unzip iproute2 iptables -y
         elif [ -x "$(command -v yum)" ]; then
-            yum install wget unzip iproute -y
+            yum install wget unzip iproute iptables-services -y
         else
-            echo -e "${RED}无法自动安装依赖，请手动安装 wget, unzip 和 iproute2。${PLAIN}"
+            echo -e "${RED}无法自动安装依赖，请手动安装 wget, unzip, iproute2 和 iptables。${PLAIN}"
         fi
     fi
 }
@@ -42,18 +43,6 @@ check_dependencies() {
 get_network_info() {
     DEFAULT_GATEWAY=$(ip route show default | awk '/default/ {print $3}')
     DEFAULT_INTERFACE=$(ip route show default | awk '/default/ {print $5}')
-    
-    # 获取当前SSH登录的IP，用于防封锁
-    # 尝试从SSH_CLIENT环境变量获取
-    CURRENT_SSH_IP=$(echo $SSH_CLIENT | awk '{print $1}')
-    
-    # 如果没获取到（可能是通过控制台登录），则设为空
-    if [[ -z "$CURRENT_SSH_IP" ]]; then
-        echo -e "${YELLOW}警告: 无法检测到SSH来源IP。如果您正在使用SSH，开启代理可能会导致断连。${PLAIN}"
-        echo -e "${YELLOW}如果您使用物理控制台(VNC/Console)，请忽略此警告。${PLAIN}"
-        read -p "是否继续？[y/n]: " continue_prompt
-        [[ "$continue_prompt" != "y" ]] && exit 1
-    fi
 }
 
 # 安装并配置
@@ -66,6 +55,10 @@ install_proxy() {
     read -p "Socks5 端口: " PROXY_PORT
     read -p "用户名 (无则直接回车): " PROXY_USER
     read -p "密码 (无则直接回车): " PROXY_PASS
+    
+    echo -e "${GREEN}>>> 请配置 SSH 防断连 ${PLAIN}"
+    read -p "请输入您的 SSH 连接端口 (默认 22): " SSH_PORT
+    [[ -z "$SSH_PORT" ]] && SSH_PORT=22
 
     if [[ -z "$PROXY_IP" || -z "$PROXY_PORT" ]]; then
         echo -e "${RED}IP和端口不能为空！${PLAIN}"
@@ -131,18 +124,25 @@ ip addr add 198.18.0.1/15 dev tun0
 
 echo "Configuring routes..."
 
-# 1. 保持 SSH 连接不走代理 (防止断连)
-if [[ -n "$CURRENT_SSH_IP" ]]; then
-    ip route add $CURRENT_SSH_IP via $DEFAULT_GATEWAY dev $DEFAULT_INTERFACE metric 10
-fi
-
-# 2. 保持 Socks5 代理服务器地址走直连 (防止死循环)
+# 1. 保持 Socks5 代理服务器地址走直连 (防止死循环)
 ip route add $PROXY_IP via $DEFAULT_GATEWAY dev $DEFAULT_INTERFACE metric 10
 
-# 3. 添加默认路由走 tun0 (覆盖默认路由但保留原路由条目)
-# 使用拆分路由 0.0.0.0/1 和 128.0.0.0/1 来覆盖 0.0.0.0/0
+# 2. 全局流量走 tun0
 ip route add 0.0.0.0/1 dev tun0
 ip route add 128.0.0.0/1 dev tun0
+
+# 3. [核心] SSH 防断连策略路由
+# 逻辑：凡是源端口为 $SSH_PORT 的TCP包，打上标记 55，然后强制走物理网关
+echo "Setting up SSH bypass for port $SSH_PORT..."
+
+# 创建路由表 100，指向物理网关
+ip route add default via $DEFAULT_GATEWAY dev $DEFAULT_INTERFACE table 100
+
+# 添加策略：标记 55 的包查表 100
+ip rule add fwmark 55 table 100
+
+# 添加防火墙标记：TCP 源端口 $SSH_PORT -> 标记 55
+iptables -t mangle -A OUTPUT -p tcp --sport $SSH_PORT -j MARK --set-mark 55
 
 # 保持前台运行
 wait \$PID
@@ -151,13 +151,18 @@ EOF
     # 生成停止脚本 (恢复路由)
     cat > "$CONFIG_DIR/stop_tun.sh" <<EOF
 #!/bin/bash
-# 删除路由规则
+# 清理 iptables 标记
+iptables -t mangle -D OUTPUT -p tcp --sport $SSH_PORT -j MARK --set-mark 55 2>/dev/null
+
+# 清理路由策略
+ip rule del fwmark 55 table 100 2>/dev/null
+ip route flush table 100 2>/dev/null
+
+# 删除常规路由规则
 ip route del 0.0.0.0/1 dev tun0 2>/dev/null
 ip route del 128.0.0.0/1 dev tun0 2>/dev/null
 ip route del $PROXY_IP via $DEFAULT_GATEWAY dev $DEFAULT_INTERFACE 2>/dev/null
-if [[ -n "$CURRENT_SSH_IP" ]]; then
-    ip route del $CURRENT_SSH_IP via $DEFAULT_GATEWAY dev $DEFAULT_INTERFACE 2>/dev/null
-fi
+
 # 杀掉进程
 pkill -f "$INSTALL_PATH"
 EOF
@@ -188,7 +193,7 @@ EOF
     systemctl start tun2socks
 
     echo -e "${GREEN}安装完成！代理已启动并设置开机自启。${PLAIN}"
-    echo -e "${YELLOW}当前 SSH IP ($CURRENT_SSH_IP) 已设置为直连。${PLAIN}"
+    echo -e "${YELLOW}SSH 端口 $SSH_PORT 的流量已强制配置为直连，不再受代理影响。${PLAIN}"
     echo -e "检查状态: systemctl status tun2socks"
 }
 
